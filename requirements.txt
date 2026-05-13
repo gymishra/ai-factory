@@ -1,0 +1,6 @@
+mcp>=1.20.0,<1.28.0
+httpx
+boto3
+uvicorn
+starlette
+strands-agents>=1.20.0,<1.31.0
