@@ -21,22 +21,131 @@ from mcp.server.fastmcp import FastMCP, Context
 from strands import Agent
 from strands.models import BedrockModel
 from strands.agent.conversation_manager import SlidingWindowConversationManager
+from strands.hooks import AgentInitializedEvent, HookProvider, HookRegistry, MessageAddedEvent
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("ai_factory")
 
 MODEL_ID = "us.anthropic.claude-sonnet-4-6"
+REGION   = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
 _PORT = int(os.environ.get("MCP_PORT", "8100"))
 mcp = FastMCP("AI Factory", host="0.0.0.0", port=_PORT, stateless_http=True)
 
-# ── Per-user agent cache ──────────────────────────────────────────────────────
-# Each (user_identity, domain) keeps its own Strands Agent so a user's
-# conversation context persists across calls/reconnects/clients. The user
-# identity is derived from the JWT (email/username/sub), NOT the transport
-# session — so it works identically for Kiro, QuickSuite, or raw HTTP.
+# ── AgentCore Memory (durable, cross-instance conversation memory) ────────────
+# A single short-term memory resource backs all router tools. Conversation turns
+# are keyed by actor_id = JWT user hash, session_id = domain. This persists
+# across container instances and restarts (unlike the in-RAM cache), so it works
+# for Kiro, QuickSuite, or any client — bound to the user's identity.
+_MEMORY_NAME = os.environ.get("AIFACTORY_MEMORY_NAME", "AIFactoryMemory")
+_MEMORY_EXPIRY_DAYS = int(os.environ.get("AIFACTORY_MEMORY_EXPIRY_DAYS", "7"))
+_memory_client = None
+_memory_id = None
+
+
+def _init_memory():
+    """Create or look up the shared AgentCore Memory resource (once)."""
+    global _memory_client, _memory_id
+    if _memory_id is not None:
+        return _memory_id
+    try:
+        from bedrock_agentcore.memory import MemoryClient
+        _memory_client = MemoryClient(region_name=REGION)
+        try:
+            mem = _memory_client.create_memory_and_wait(
+                name=_MEMORY_NAME,
+                strategies=[],                       # short-term only
+                description="AI Factory per-user conversation memory",
+                event_expiry_days=_MEMORY_EXPIRY_DAYS,
+            )
+            _memory_id = mem["id"]
+            logger.info(f"Created AgentCore memory: {_memory_id}")
+        except Exception as e:
+            # Likely already exists — look it up and wait until ACTIVE
+            if "already exists" in str(e) or "ValidationException" in str(e):
+                for m in _memory_client.list_memories():
+                    if m["id"].startswith(_MEMORY_NAME):
+                        _memory_id = m["id"]
+                        break
+                logger.info(f"Using existing AgentCore memory: {_memory_id}")
+                # Wait for ACTIVE — create_event/list fail while still CREATING
+                if _memory_id:
+                    for _ in range(20):
+                        try:
+                            st = _memory_client.get_memory(memory_id=_memory_id).get("status")
+                        except Exception:
+                            st = None
+                        if st == "ACTIVE":
+                            break
+                        logger.info(f"Memory {_memory_id} status={st}, waiting...")
+                        time.sleep(10)
+            else:
+                raise
+    except Exception as e:
+        logger.warning(f"AgentCore Memory unavailable ({e}); falling back to in-RAM only")
+        _memory_client = None
+        _memory_id = None
+    return _memory_id
+
+
+class _MemoryHook(HookProvider):
+    """Loads the user's recent turns on agent init and saves each new turn.
+    actor_id = JWT user hash, session_id = domain (set via agent.state)."""
+
+    def __init__(self, client, memory_id: str):
+        self._client = client
+        self._memory_id = memory_id
+
+    def on_agent_initialized(self, event: AgentInitializedEvent):
+        try:
+            actor_id = event.agent.state.get("actor_id")
+            session_id = event.agent.state.get("session_id")
+            if not (actor_id and session_id):
+                return
+            turns = self._client.get_last_k_turns(
+                memory_id=self._memory_id, actor_id=actor_id,
+                session_id=session_id, k=8)
+            if turns:
+                lines = []
+                for turn in turns:
+                    for msg in turn:
+                        txt = msg.get("content", {}).get("text", "")
+                        if txt:
+                            lines.append(f"{msg.get('role','?')}: {txt}")
+                if lines:
+                    event.agent.system_prompt += (
+                        "\n\nRecent conversation (from memory):\n" + "\n".join(lines))
+                    logger.info(f"Loaded {len(turns)} turns for actor={actor_id} session={session_id}")
+        except Exception as e:
+            logger.error(f"Memory load error: {e}")
+
+    def on_message_added(self, event: MessageAddedEvent):
+        try:
+            actor_id = event.agent.state.get("actor_id")
+            session_id = event.agent.state.get("session_id")
+            if not (actor_id and session_id):
+                return
+            msgs = event.agent.messages
+            last = msgs[-1]
+            text = ""
+            content = last.get("content")
+            if isinstance(content, list) and content and isinstance(content[0], dict):
+                text = content[0].get("text", "")
+            if text:
+                self._client.create_event(
+                    memory_id=self._memory_id, actor_id=actor_id,
+                    session_id=session_id, messages=[(text, last.get("role", "user"))])
+        except Exception as e:
+            logger.error(f"Memory save error: {e}")
+
+    def register_hooks(self, registry: HookRegistry):
+        registry.add_callback(AgentInitializedEvent, self.on_agent_initialized)
+        registry.add_callback(MessageAddedEvent, self.on_message_added)
+
+
+# ── Per-user agent cache (warm-start optimization; memory is durable in AgentCore) ──
 _agent_cache: dict = {}          # key -> (Agent, last_used_ts)
-_AGENT_TTL = 1800                # 30 min idle → drop the user's agent
+_AGENT_TTL = 1800                # 30 min idle → drop the warm agent
 _MAX_TURNS = int(os.environ.get("MAX_AGENT_TURNS", "12"))
 
 
@@ -199,17 +308,26 @@ def _run(system_prompt: str, question: str, tool_functions: list,
             _agent_cache.pop(key, None)   # idle TTL expired
 
     if agent is None:
+        memory_id = _init_memory()
+        hooks = []
+        state = {}
+        if memory_id and _memory_client is not None:
+            hooks = [_MemoryHook(_memory_client, memory_id)]
+            # actor_id = per-user identity; session_id = domain (separate thread per domain)
+            state = {"actor_id": f"u_{user}", "session_id": domain}
         agent = Agent(
             model=BedrockModel(model_id=MODEL_ID, max_tokens=16000, temperature=0.1),
             tools=tool_functions,
             system_prompt=system_prompt,
+            hooks=hooks,
+            state=state,
             conversation_manager=SlidingWindowConversationManager(
                 window_size=_MAX_TURNS,
                 should_truncate_results=True,
             ),
         )
         _agent_cache[key] = (agent, now)
-        logger.info(f"Agent created for user={user} domain={domain}")
+        logger.info(f"Agent created for user={user} domain={domain} memory={'on' if memory_id else 'off'}")
     else:
         # refresh timestamp so an active user's agent stays warm
         _agent_cache[key] = (agent, now)
@@ -360,4 +478,10 @@ if __name__ == "__main__":
     logger.info(f"=== AI Factory Parent MCP Server (in-process) starting on port {_PORT} ===")
     logger.info(f"Tools loaded: ADT={len(_ADT_TOOLS)} OData={len(_ODATA_TOOLS)} "
                 f"CALM={len(_CALM_TOOLS)} SF={len(_SF_TOOLS)} Gen={len(_GEN_TOOLS)}")
+    # Initialize the shared AgentCore Memory resource up front (best-effort)
+    try:
+        mid = _init_memory()
+        logger.info(f"AgentCore Memory: {'ready (' + mid + ')' if mid else 'disabled — in-RAM only'}")
+    except Exception as e:
+        logger.warning(f"Memory init skipped: {e}")
     mcp.run(transport="streamable-http")
