@@ -14,7 +14,7 @@ sap-smart-agent) executes SAP calls directly and returns in a few seconds.
 Token flow: the request's JWT is set into os.environ['SAP_BEARER_TOKEN'] so the
 imported tools' _get_token(ctx) fallback picks it up in-process.
 """
-import os, sys, json, logging, time
+import os, sys, json, logging, time, base64, hashlib
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mcp.server.fastmcp import FastMCP, Context
@@ -30,12 +30,13 @@ MODEL_ID = "us.anthropic.claude-sonnet-4-6"
 _PORT = int(os.environ.get("MCP_PORT", "8100"))
 mcp = FastMCP("AI Factory", host="0.0.0.0", port=_PORT, stateless_http=True)
 
-# ── Session-scoped agent cache ────────────────────────────────────────────────
-# Each (session_id, domain) keeps its own Strands Agent so follow-up questions
-# retain conversation context ("show details of the first one"). Agents are
-# reused within a session and refreshed when the token changes or they go stale.
-_agent_cache: dict = {}          # key -> (Agent, created_ts, token)
-_AGENT_TTL = 1800                # 30 min — drop idle session agents
+# ── Per-user agent cache ──────────────────────────────────────────────────────
+# Each (user_identity, domain) keeps its own Strands Agent so a user's
+# conversation context persists across calls/reconnects/clients. The user
+# identity is derived from the JWT (email/username/sub), NOT the transport
+# session — so it works identically for Kiro, QuickSuite, or raw HTTP.
+_agent_cache: dict = {}          # key -> (Agent, last_used_ts)
+_AGENT_TTL = 1800                # 30 min idle → drop the user's agent
 _MAX_TURNS = int(os.environ.get("MAX_AGENT_TURNS", "12"))
 
 
@@ -135,46 +136,67 @@ def _extract_token(ctx: Context) -> str:
     return os.environ.get("SAP_BEARER_TOKEN", "")
 
 
-def _session_id(ctx: Context) -> str:
-    """Derive a stable session key from the request so an agent's conversation
-    persists across turns. Uses the MCP session header; falls back to 'default'."""
+def _decode_jwt_claims(token: str) -> dict:
+    """Decode JWT payload (no signature check — AgentCore already validated it)."""
     try:
-        req = ctx.request_context.request
-        for h in ["mcp-session-id", "Mcp-Session-Id",
-                  "x-amzn-bedrock-agentcore-runtime-session-id",
-                  "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id"]:
-            val = req.headers.get(h, "")
-            if val:
-                return val
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
     except Exception:
-        pass
-    return "default"
+        return {}
 
 
-# ── In-process Strands runner (session-scoped, with conversation memory) ──────
+def _user_key(token: str) -> str:
+    """Derive a STABLE per-user memory key from the JWT identity claims.
+
+    This is client-independent — it works the same whether the caller is Kiro,
+    QuickSuite, or a raw HTTP client, and survives reconnects/new transport
+    sessions because it is bound to the user's identity, not the connection.
+
+    Preference order (most human-meaningful first):
+      email → preferred_username → upn → unique_name → username → sub → client_id
+    The chosen value is hashed so we never use raw PII as a dict key / in logs.
+    """
+    claims = _decode_jwt_claims(token)
+    raw = ""
+    for c in ("email", "preferred_username", "upn", "unique_name",
+              "username", "sub", "client_id", "cid"):
+        v = claims.get(c)
+        if v:
+            raw = str(v)
+            break
+    if not raw:
+        raw = "anonymous"
+    digest = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return digest
+
+
+# ── In-process Strands runner (USER-scoped, with conversation memory) ─────────
 def _run(system_prompt: str, question: str, tool_functions: list,
-         token: str, session_id: str, domain: str) -> str:
+         token: str, domain: str) -> str:
     """Run a Strands Agent with DIRECT Python function tools (no MCP/HTTP hop).
 
-    The agent is cached per (session_id, domain) so multi-turn context is kept —
-    e.g. 'show inactive BADIs' then 'open the first one'. The conversation history
-    is bounded by SlidingWindowConversationManager to prevent unbounded growth.
-    Token is injected into env so each tool's _get_token(ctx) fallback finds it.
+    Memory is keyed by (user_identity, domain) extracted from the JWT — NOT by
+    transport session. So a user's conversation context persists across calls,
+    reconnects, and clients (Kiro, QuickSuite, etc.). History is bounded by
+    SlidingWindowConversationManager. The SAP token is refreshed in env on every
+    call (it rotates ~hourly) without discarding the conversation memory.
     """
     if token:
         os.environ["SAP_BEARER_TOKEN"] = token
 
-    key = f"{session_id}::{domain}"
+    user = _user_key(token)
+    key = f"{user}::{domain}"
     now = time.time()
 
     agent = None
     cached = _agent_cache.get(key)
     if cached:
-        c_agent, created, c_token = cached
-        if now - created < _AGENT_TTL and c_token == token:
-            agent = c_agent          # reuse — keeps conversation history
+        c_agent, created = cached
+        if now - created < _AGENT_TTL:
+            agent = c_agent          # reuse — keeps the user's conversation history
         else:
-            _agent_cache.pop(key, None)   # stale or token changed
+            _agent_cache.pop(key, None)   # idle TTL expired
 
     if agent is None:
         agent = Agent(
@@ -186,10 +208,12 @@ def _run(system_prompt: str, question: str, tool_functions: list,
                 should_truncate_results=True,
             ),
         )
-        _agent_cache[key] = (agent, now, token)
-        logger.info(f"Agent created for session={session_id} domain={domain}")
+        _agent_cache[key] = (agent, now)
+        logger.info(f"Agent created for user={user} domain={domain}")
     else:
-        logger.info(f"Agent reused for session={session_id} domain={domain}")
+        # refresh timestamp so an active user's agent stays warm
+        _agent_cache[key] = (agent, now)
+        logger.info(f"Agent reused for user={user} domain={domain}")
 
     try:
         result = agent(question)
@@ -199,7 +223,7 @@ def _run(system_prompt: str, question: str, tool_functions: list,
             return "\n".join(parts) if parts else str(result)
         return str(result)
     except Exception as e:
-        logger.error(f"Strands runner error (session={session_id} domain={domain}): {e}")
+        logger.error(f"Strands runner error (user={user} domain={domain}): {e}")
         # Drop the possibly-corrupted cached agent so the next call starts fresh
         _agent_cache.pop(key, None)
         return json.dumps({"error": str(e)})
@@ -230,7 +254,7 @@ def adt_agent_tool(ctx: Context, question: str) -> str:
         "generate SQL and run via get_table_contents. "
         "For OData creation: create_odata_service → activate_odata_service. "
         "Always confirm before creating or deploying anything.",
-        question, _ADT_TOOLS, _extract_token(ctx), _session_id(ctx), "adt")
+        question, _ADT_TOOLS, _extract_token(ctx), "adt")
 
 
 @mcp.tool()
@@ -276,7 +300,7 @@ def odata_agent_tool(ctx: Context, question: str) -> str:
         "- NEVER silently fall back without telling the user what happened at each tier.\n"
         "- ALWAYS end with a 'Data Source' section: which tier, service/table, and exact query used.\n"
         "- For complex questions use smart_query.",
-        question, _ODATA_TOOLS, _extract_token(ctx), _session_id(ctx), "odata")
+        question, _ODATA_TOOLS, _extract_token(ctx), "odata")
 
 
 @mcp.tool()
@@ -293,7 +317,7 @@ def calm_agent_tool(ctx: Context, question: str) -> str:
         "You are the Cloud ALM Agent — SAP Rise/Cloud ERP specialist. "
         "For analytics, call calm_list_analytics_providers first to discover datasets, "
         "then calm_query_analytics.",
-        question, _CALM_TOOLS, _extract_token(ctx), _session_id(ctx), "calm")
+        question, _CALM_TOOLS, _extract_token(ctx), "calm")
 
 
 @mcp.tool()
@@ -309,7 +333,7 @@ def sf_agent_tool(ctx: Context, question: str) -> str:
     return _run(
         "You are the SuccessFactors Agent — SAP HCM specialist. "
         "Always use filters to narrow results. Avoid pulling large unfiltered datasets.",
-        question, _SF_TOOLS, _extract_token(ctx), _session_id(ctx), "sf")
+        question, _SF_TOOLS, _extract_token(ctx), "sf")
 
 
 @mcp.tool()
@@ -329,7 +353,7 @@ def generator_agent_tool(ctx: Context, question: str) -> str:
         "You are the Generator Agent — SAP MCP agent factory. "
         "Use generate_and_deploy_mcp_server with a clear prompt and snake_case agent_name. "
         "Always confirm agent_name and domain before deploying.",
-        question, _GEN_TOOLS, _extract_token(ctx), _session_id(ctx), "gen")
+        question, _GEN_TOOLS, _extract_token(ctx), "gen")
 
 
 if __name__ == "__main__":
