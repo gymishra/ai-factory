@@ -44,48 +44,47 @@ _memory_id = None
 
 
 def _init_memory():
-    """Create or look up the shared AgentCore Memory resource (once)."""
+    """Look up (or create) the shared AgentCore Memory resource — best-effort,
+    NON-BLOCKING. Never blocks server startup: if the resource isn't ACTIVE yet,
+    we simply skip memory for this call and retry on the next one."""
     global _memory_client, _memory_id
     if _memory_id is not None:
         return _memory_id
     try:
         from bedrock_agentcore.memory import MemoryClient
-        _memory_client = MemoryClient(region_name=REGION)
+        if _memory_client is None:
+            _memory_client = MemoryClient(region_name=REGION)
+        # Prefer an already-ACTIVE resource (avoids create/validation churn)
         try:
-            mem = _memory_client.create_memory_and_wait(
+            for m in _memory_client.list_memories():
+                if m["id"].startswith(_MEMORY_NAME):
+                    if m.get("status") == "ACTIVE":
+                        _memory_id = m["id"]
+                        logger.info(f"Using ACTIVE AgentCore memory: {_memory_id}")
+                        return _memory_id
+                    else:
+                        logger.info(f"Memory {m['id']} status={m.get('status')} (not ready yet)")
+                        return None      # not ready — skip memory this call, retry next
+        except Exception as le:
+            logger.warning(f"list_memories failed: {le}")
+        # None found — create it (don't wait/block; it'll be ACTIVE on a later call)
+        try:
+            mem = _memory_client.create_memory(
                 name=_MEMORY_NAME,
-                strategies=[],                       # short-term only
+                strategies=[],
                 description="AI Factory per-user conversation memory",
                 event_expiry_days=_MEMORY_EXPIRY_DAYS,
             )
-            _memory_id = mem["id"]
-            logger.info(f"Created AgentCore memory: {_memory_id}")
-        except Exception as e:
-            # Likely already exists — look it up and wait until ACTIVE
-            if "already exists" in str(e) or "ValidationException" in str(e):
-                for m in _memory_client.list_memories():
-                    if m["id"].startswith(_MEMORY_NAME):
-                        _memory_id = m["id"]
-                        break
-                logger.info(f"Using existing AgentCore memory: {_memory_id}")
-                # Wait for ACTIVE — create_event/list fail while still CREATING
-                if _memory_id:
-                    for _ in range(20):
-                        try:
-                            st = _memory_client.get_memory(memory_id=_memory_id).get("status")
-                        except Exception:
-                            st = None
-                        if st == "ACTIVE":
-                            break
-                        logger.info(f"Memory {_memory_id} status={st}, waiting...")
-                        time.sleep(10)
-            else:
-                raise
+            logger.info(f"Requested new AgentCore memory: {mem.get('id')} (provisioning)")
+        except Exception as ce:
+            if "already exists" not in str(ce):
+                logger.warning(f"create_memory failed: {ce}")
+        return None      # not ready this call; a later call will pick it up ACTIVE
     except Exception as e:
-        logger.warning(f"AgentCore Memory unavailable ({e}); falling back to in-RAM only")
+        logger.warning(f"AgentCore Memory unavailable ({e}); in-RAM only")
         _memory_client = None
         _memory_id = None
-    return _memory_id
+        return None
 
 
 class _MemoryHook(HookProvider):
@@ -478,10 +477,10 @@ if __name__ == "__main__":
     logger.info(f"=== AI Factory Parent MCP Server (in-process) starting on port {_PORT} ===")
     logger.info(f"Tools loaded: ADT={len(_ADT_TOOLS)} OData={len(_ODATA_TOOLS)} "
                 f"CALM={len(_CALM_TOOLS)} SF={len(_SF_TOOLS)} Gen={len(_GEN_TOOLS)}")
-    # Initialize the shared AgentCore Memory resource up front (best-effort)
+    # Best-effort memory probe (non-blocking — never delays serving tools)
     try:
         mid = _init_memory()
-        logger.info(f"AgentCore Memory: {'ready (' + mid + ')' if mid else 'disabled — in-RAM only'}")
+        logger.info(f"AgentCore Memory: {'ready (' + mid + ')' if mid else 'provisioning/in-RAM for now'}")
     except Exception as e:
         logger.warning(f"Memory init skipped: {e}")
     mcp.run(transport="streamable-http")
