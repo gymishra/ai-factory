@@ -25,7 +25,7 @@ MODEL_ID     = "us.anthropic.claude-sonnet-4-6"
 SAP_BASE_URL = os.environ.get("SAP_BASE_URL", "https://vhcals4hci.awspoc.club")
 CATALOG_URL  = "/sap/opu/odata/IWFND/CATALOGSERVICE;v=2/ServiceCollection"
 
-mcp = FastMCP("AI Factory — Generator Agent", host="0.0.0.0", port=8105, stateless_http=True)
+mcp = FastMCP("AI Factory — Generator Agent", host="0.0.0.0", port=8105)
 logger = logging.getLogger("ai_factory_generator")
 
 # ── Domain detection ──────────────────────────────────────────────────────────

@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("sf_agent")
 
 MODEL_ID = "us.anthropic.claude-sonnet-4-6"
-mcp = FastMCP("AI Factory — SuccessFactors Agent", host="0.0.0.0", port=8104, stateless_http=True)
+mcp = FastMCP("AI Factory — SuccessFactors Agent", host="0.0.0.0", port=8104)
 
 for fn in [
     sf_list_employees, sf_get_employee_employment, sf_list_positions,

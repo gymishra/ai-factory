@@ -1,6 +1,8 @@
-mcp>=1.20.0,<1.28.0
+mcp>=1.10.0,<1.20.0
 httpx
 boto3
 uvicorn
 starlette
-strands-agents>=1.20.0,<1.31.0
+strands-agents>=1.0.0,<1.10.0
+bedrock-agentcore<=0.1.5
+bedrock-agentcore-starter-toolkit==0.1.14

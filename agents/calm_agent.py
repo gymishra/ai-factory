@@ -34,7 +34,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("calm_agent")
 
 MODEL_ID = "us.anthropic.claude-sonnet-4-6"
-mcp = FastMCP("AI Factory — Cloud ALM Agent", host="0.0.0.0", port=8103, stateless_http=True)
+mcp = FastMCP("AI Factory — Cloud ALM Agent", host="0.0.0.0", port=8103)
 
 # Register all Cloud ALM tools
 for fn in [

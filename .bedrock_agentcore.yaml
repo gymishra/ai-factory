@@ -1,0 +1,31 @@
+default_agent: sap_ai_factory
+agents:
+  sap_ai_factory:
+    name: sap_ai_factory
+    entrypoint: agents/parent_mcp_server.py
+    platform: linux/arm64
+    container_runtime: docker
+    aws:
+      execution_role: arn:aws:iam::953841955037:role/AmazonBedrockAgentCoreSDKRuntime-us-east-1-83ade8403e
+      execution_role_auto_create: false
+      account: '953841955037'
+      region: us-east-1
+      ecr_repository: 953841955037.dkr.ecr.us-east-1.amazonaws.com/bedrock-agentcore-sap_ai_factory
+      ecr_auto_create: false
+      network_configuration:
+        network_mode: PUBLIC
+      protocol_configuration:
+        server_protocol: MCP
+      observability:
+        enabled: true
+    bedrock_agentcore:
+      agent_id: sap_ai_factory-OFYrcN3gxF
+      agent_arn: arn:aws:bedrock-agentcore:us-east-1:953841955037:runtime/sap_ai_factory-OFYrcN3gxF
+      agent_session_id: null
+    codebuild:
+      project_name: bedrock-agentcore-sap_ai_factory-builder
+      execution_role: arn:aws:iam::953841955037:role/AmazonBedrockAgentCoreSDKCodeBuild-us-east-1-83ade8403e
+      source_bucket: bedrock-agentcore-codebuild-sources-953841955037-us-east-1
+    authorizer_configuration: null
+    request_header_configuration: null
+    oauth_configuration: null

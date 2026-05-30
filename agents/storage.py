@@ -18,9 +18,11 @@ import os, json, logging, time, hashlib
 
 logger = logging.getLogger("ai_factory.storage")
 
-# EFS in Fargate, local .data/ in dev
-DATA_DIR = os.environ.get("AI_FACTORY_DATA_DIR",
-                          os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".data"))
+# EFS in Fargate, /tmp/.data as container fallback, local .data/ in dev
+_default_data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".data")
+if not os.access(os.path.dirname(_default_data_dir), os.W_OK):
+    _default_data_dir = "/tmp/.data"
+DATA_DIR = os.environ.get("AI_FACTORY_DATA_DIR", _default_data_dir)
 
 CACHE_DIR     = os.path.join(DATA_DIR, "cache")
 ENTITIES_DIR  = os.path.join(DATA_DIR, "cache", "entities")

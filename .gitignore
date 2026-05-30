@@ -7,3 +7,9 @@ dist/
 build/
 .local_token_cache*.json
 /data/
+
+# Secrets and machine-specific files — never commit
+.okta_token_cache.json
+.kiro/
+*.zip
+source_fresh.zip
