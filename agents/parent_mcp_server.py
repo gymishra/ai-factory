@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mcp.server.fastmcp import FastMCP, Context
 from strands import Agent
 from strands.models import BedrockModel
+from strands.agent.conversation_manager import SlidingWindowConversationManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("ai_factory")
@@ -28,6 +29,14 @@ MODEL_ID = "us.anthropic.claude-sonnet-4-6"
 
 _PORT = int(os.environ.get("MCP_PORT", "8100"))
 mcp = FastMCP("AI Factory", host="0.0.0.0", port=_PORT, stateless_http=True)
+
+# ── Session-scoped agent cache ────────────────────────────────────────────────
+# Each (session_id, domain) keeps its own Strands Agent so follow-up questions
+# retain conversation context ("show details of the first one"). Agents are
+# reused within a session and refreshed when the token changes or they go stale.
+_agent_cache: dict = {}          # key -> (Agent, created_ts, token)
+_AGENT_TTL = 1800                # 30 min — drop idle session agents
+_MAX_TURNS = int(os.environ.get("MAX_AGENT_TURNS", "12"))
 
 
 # ── Import tool functions in-process from each agent module ───────────────────
@@ -126,27 +135,73 @@ def _extract_token(ctx: Context) -> str:
     return os.environ.get("SAP_BEARER_TOKEN", "")
 
 
-# ── In-process Strands runner ─────────────────────────────────────────────────
-def _run(system_prompt: str, question: str, tool_functions: list, token: str) -> str:
+def _session_id(ctx: Context) -> str:
+    """Derive a stable session key from the request so an agent's conversation
+    persists across turns. Uses the MCP session header; falls back to 'default'."""
+    try:
+        req = ctx.request_context.request
+        for h in ["mcp-session-id", "Mcp-Session-Id",
+                  "x-amzn-bedrock-agentcore-runtime-session-id",
+                  "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id"]:
+            val = req.headers.get(h, "")
+            if val:
+                return val
+    except Exception:
+        pass
+    return "default"
+
+
+# ── In-process Strands runner (session-scoped, with conversation memory) ──────
+def _run(system_prompt: str, question: str, tool_functions: list,
+         token: str, session_id: str, domain: str) -> str:
     """Run a Strands Agent with DIRECT Python function tools (no MCP/HTTP hop).
-    Token is injected into env so each tool's _get_token(ctx) fallback finds it."""
+
+    The agent is cached per (session_id, domain) so multi-turn context is kept —
+    e.g. 'show inactive BADIs' then 'open the first one'. The conversation history
+    is bounded by SlidingWindowConversationManager to prevent unbounded growth.
+    Token is injected into env so each tool's _get_token(ctx) fallback finds it.
+    """
     if token:
         os.environ["SAP_BEARER_TOKEN"] = token
-    try:
+
+    key = f"{session_id}::{domain}"
+    now = time.time()
+
+    agent = None
+    cached = _agent_cache.get(key)
+    if cached:
+        c_agent, created, c_token = cached
+        if now - created < _AGENT_TTL and c_token == token:
+            agent = c_agent          # reuse — keeps conversation history
+        else:
+            _agent_cache.pop(key, None)   # stale or token changed
+
+    if agent is None:
         agent = Agent(
             model=BedrockModel(model_id=MODEL_ID, max_tokens=16000, temperature=0.1),
             tools=tool_functions,
             system_prompt=system_prompt,
+            conversation_manager=SlidingWindowConversationManager(
+                window_size=_MAX_TURNS,
+                should_truncate_results=True,
+            ),
         )
+        _agent_cache[key] = (agent, now, token)
+        logger.info(f"Agent created for session={session_id} domain={domain}")
+    else:
+        logger.info(f"Agent reused for session={session_id} domain={domain}")
+
+    try:
         result = agent(question)
-        # Extract plain text (avoids MCP outputSchema validation on AgentResult)
         if hasattr(result, "message") and isinstance(result.message, dict):
             parts = [c.get("text", "") for c in result.message.get("content", [])
                      if isinstance(c, dict) and c.get("text")]
             return "\n".join(parts) if parts else str(result)
         return str(result)
     except Exception as e:
-        logger.error(f"Strands runner error: {e}")
+        logger.error(f"Strands runner error (session={session_id} domain={domain}): {e}")
+        # Drop the possibly-corrupted cached agent so the next call starts fresh
+        _agent_cache.pop(key, None)
         return json.dumps({"error": str(e)})
 
 
@@ -175,7 +230,7 @@ def adt_agent_tool(ctx: Context, question: str) -> str:
         "generate SQL and run via get_table_contents. "
         "For OData creation: create_odata_service → activate_odata_service. "
         "Always confirm before creating or deploying anything.",
-        question, _ADT_TOOLS, _extract_token(ctx))
+        question, _ADT_TOOLS, _extract_token(ctx), _session_id(ctx), "adt")
 
 
 @mcp.tool()
@@ -221,7 +276,7 @@ def odata_agent_tool(ctx: Context, question: str) -> str:
         "- NEVER silently fall back without telling the user what happened at each tier.\n"
         "- ALWAYS end with a 'Data Source' section: which tier, service/table, and exact query used.\n"
         "- For complex questions use smart_query.",
-        question, _ODATA_TOOLS, _extract_token(ctx))
+        question, _ODATA_TOOLS, _extract_token(ctx), _session_id(ctx), "odata")
 
 
 @mcp.tool()
@@ -238,7 +293,7 @@ def calm_agent_tool(ctx: Context, question: str) -> str:
         "You are the Cloud ALM Agent — SAP Rise/Cloud ERP specialist. "
         "For analytics, call calm_list_analytics_providers first to discover datasets, "
         "then calm_query_analytics.",
-        question, _CALM_TOOLS, _extract_token(ctx))
+        question, _CALM_TOOLS, _extract_token(ctx), _session_id(ctx), "calm")
 
 
 @mcp.tool()
@@ -254,7 +309,7 @@ def sf_agent_tool(ctx: Context, question: str) -> str:
     return _run(
         "You are the SuccessFactors Agent — SAP HCM specialist. "
         "Always use filters to narrow results. Avoid pulling large unfiltered datasets.",
-        question, _SF_TOOLS, _extract_token(ctx))
+        question, _SF_TOOLS, _extract_token(ctx), _session_id(ctx), "sf")
 
 
 @mcp.tool()
@@ -274,7 +329,7 @@ def generator_agent_tool(ctx: Context, question: str) -> str:
         "You are the Generator Agent — SAP MCP agent factory. "
         "Use generate_and_deploy_mcp_server with a clear prompt and snake_case agent_name. "
         "Always confirm agent_name and domain before deploying.",
-        question, _GEN_TOOLS, _extract_token(ctx))
+        question, _GEN_TOOLS, _extract_token(ctx), _session_id(ctx), "gen")
 
 
 if __name__ == "__main__":
