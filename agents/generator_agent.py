@@ -461,43 +461,10 @@ if __name__ == "__main__":
 
 
 # ── Infrastructure provisioning ───────────────────────────────────────────────
-def _ensure_infrastructure(region: str, ssm, cb, s3) -> tuple:
-    """Idempotent: provision S3 + CodeBuild on first use, return (bucket, project)."""
-    CODEBUILD_PROJECT = "sap-mcp-generator"
-    account_id = boto3.client("sts", region_name=region).get_caller_identity()["Account"]
-    STAGING_BUCKET = f"sap-mcp-generator-{account_id}-{region}"
-    try:
-        bucket = ssm.get_parameter(Name="/sap_smart_agent/staging_bucket")["Parameter"]["Value"]
-        project = ssm.get_parameter(Name="/sap_smart_agent/codebuild_project")["Parameter"]["Value"]
-        return bucket, project
-    except ssm.exceptions.ParameterNotFound:
-        pass
-
-    iam = boto3.client("iam", region_name=region)
-    ROLE = "sap-mcp-generator-codebuild-role"
-    trust = {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
-        "Principal":{"Service":"codebuild.amazonaws.com"},"Action":"sts:AssumeRole"}]}
-    try:
-        role_arn = iam.create_role(RoleName=ROLE, AssumeRolePolicyDocument=json.dumps(trust))["Role"]["Arn"]
-    except iam.exceptions.EntityAlreadyExistsException:
-        role_arn = iam.get_role(RoleName=ROLE)["Role"]["Arn"]
-
-    iam.put_role_policy(RoleName=ROLE, PolicyName="policy", PolicyDocument=json.dumps({
-        "Version":"2012-10-17","Statement":[
-            {"Effect":"Allow","Action":["logs:*"],"Resource":f"arn:aws:logs:{region}:{account_id}:log-group:/aws/codebuild/{CODEBUILD_PROJECT}*"},
-            {"Effect":"Allow","Action":["s3:*"],"Resource":[f"arn:aws:s3:::{STAGING_BUCKET}",f"arn:aws:s3:::{STAGING_BUCKET}/*"]},
-            {"Effect":"Allow","Action":["ssm:GetParameter","ssm:PutParameter"],"Resource":f"arn:aws:ssm:{region}:{account_id}:parameter/sap_*"},
-            {"Effect":"Allow","Action":["ecr:*","bedrock-agentcore:*","iam:CreateRole","iam:AttachRolePolicy","iam:PassRole","iam:GetRole","iam:PutRolePolicy"],"Resource":"*"},
-        ]}))
-
-    try:
-        if region == "us-east-1": s3.create_bucket(Bucket=STAGING_BUCKET)
-        else: s3.create_bucket(Bucket=STAGING_BUCKET, CreateBucketConfiguration={"LocationConstraint": region})
-    except Exception: pass
-
-    import time as _time; _time.sleep(10)
-
-    buildspec = """version: 0.2
+# ── CodeBuild buildspec (clean, canonical). Passed as buildspecOverride on every
+# start_build so we never depend on a stale/broken buildspec stored in the shared
+# project (an older project had a malformed YAML buildspec that broke DOWNLOAD_SOURCE).
+_BUILDSPEC = """version: 0.2
 env:
   parameter-store:
     OKTA_CLIENT_ID: "/sap_smart_agent/okta_client_id"
@@ -539,6 +506,45 @@ phases:
         else: exit(1)
         EOF
 """
+
+
+def _ensure_infrastructure(region: str, ssm, cb, s3) -> tuple:
+    """Idempotent: provision S3 + CodeBuild on first use, return (bucket, project)."""
+    CODEBUILD_PROJECT = "sap-mcp-generator"
+    account_id = boto3.client("sts", region_name=region).get_caller_identity()["Account"]
+    STAGING_BUCKET = f"sap-mcp-generator-{account_id}-{region}"
+    try:
+        bucket = ssm.get_parameter(Name="/sap_smart_agent/staging_bucket")["Parameter"]["Value"]
+        project = ssm.get_parameter(Name="/sap_smart_agent/codebuild_project")["Parameter"]["Value"]
+        return bucket, project
+    except ssm.exceptions.ParameterNotFound:
+        pass
+
+    iam = boto3.client("iam", region_name=region)
+    ROLE = "sap-mcp-generator-codebuild-role"
+    trust = {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+        "Principal":{"Service":"codebuild.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+    try:
+        role_arn = iam.create_role(RoleName=ROLE, AssumeRolePolicyDocument=json.dumps(trust))["Role"]["Arn"]
+    except iam.exceptions.EntityAlreadyExistsException:
+        role_arn = iam.get_role(RoleName=ROLE)["Role"]["Arn"]
+
+    iam.put_role_policy(RoleName=ROLE, PolicyName="policy", PolicyDocument=json.dumps({
+        "Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["logs:*"],"Resource":f"arn:aws:logs:{region}:{account_id}:log-group:/aws/codebuild/{CODEBUILD_PROJECT}*"},
+            {"Effect":"Allow","Action":["s3:*"],"Resource":[f"arn:aws:s3:::{STAGING_BUCKET}",f"arn:aws:s3:::{STAGING_BUCKET}/*"]},
+            {"Effect":"Allow","Action":["ssm:GetParameter","ssm:PutParameter"],"Resource":f"arn:aws:ssm:{region}:{account_id}:parameter/sap_*"},
+            {"Effect":"Allow","Action":["ecr:*","bedrock-agentcore:*","iam:CreateRole","iam:AttachRolePolicy","iam:PassRole","iam:GetRole","iam:PutRolePolicy"],"Resource":"*"},
+        ]}))
+
+    try:
+        if region == "us-east-1": s3.create_bucket(Bucket=STAGING_BUCKET)
+        else: s3.create_bucket(Bucket=STAGING_BUCKET, CreateBucketConfiguration={"LocationConstraint": region})
+    except Exception: pass
+
+    import time as _time; _time.sleep(10)
+
+    buildspec = _BUILDSPEC
     try:
         cb.create_project(name=CODEBUILD_PROJECT, description="SAP MCP generator",
             source={"type":"NO_SOURCE","buildspec":buildspec},
@@ -1043,6 +1049,7 @@ def _run_generation_job(job_id: str, token: str, prompt: str, agent_name: str,
             _jobs[job_id]["status"] = "starting_codebuild"
             build_resp = cb.start_build(
                 projectName=codebuild_project,
+                buildspecOverride=_BUILDSPEC,   # always use the clean canonical buildspec
                 environmentVariablesOverride=[
                     {"name": "BUILD_ID",        "value": build_id,        "type": "PLAINTEXT"},
                     {"name": "STAGING_BUCKET",  "value": staging_bucket,  "type": "PLAINTEXT"},
@@ -1050,8 +1057,13 @@ def _run_generation_job(job_id: str, token: str, prompt: str, agent_name: str,
             cb_build_id = build_resp["build"]["id"]
             _jobs[job_id]["codebuild_build_id"] = cb_build_id
 
-            # Write bridge + mcp.json
-            _write_agent_bridge_and_mcp_config(agent_name, region)
+            # Write bridge + mcp.json — LOCAL-DEV convenience only. Inside the
+            # AgentCore container the filesystem is read-only, so this will raise;
+            # it must NOT fail the deploy (CodeBuild has already started).
+            try:
+                _write_agent_bridge_and_mcp_config(agent_name, region)
+            except Exception as we:
+                logger.warning(f"[{job_id}] Skipped bridge/mcp.json write (non-fatal): {we}")
 
             _jobs[job_id]["status"] = "deploying"
             _jobs[job_id]["ssm_arn_key"] = f"/sap_generated/{agent_name}/agent_arn"
