@@ -227,6 +227,185 @@ if __name__ == "__main__":
     mcp.run(transport="streamable-http")
 '''
 
+# ── SQL-backed S/4HANA agent (ABAP SQL via ADT Data Preview — no OData/CDS) ───
+_S4_SQL_TEMPLATE = '''"""
+__DESCRIPTION__ — Auto-generated AI Factory MCP Agent (S/4HANA, SQL-backed).
+Runs ABAP SQL directly via the ADT Data Preview endpoint. No OData services or
+CDS views required. The validated Okta JWT is forwarded to SAP as the bearer
+token (SAP trusts Okta-issued JWTs), exactly like the AI Factory parent.
+"""
+import os, json, logging, re, httpx
+from datetime import date, datetime, timedelta
+from xml.etree import ElementTree as ET
+from mcp.server.fastmcp import FastMCP, Context
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("__AGENT_NAME__")
+SAP_BASE_URL = os.environ.get("SAP_BASE_URL", "https://vhcals4hci.awspoc.club")
+ADT_FREESTYLE = "/sap/bc/adt/datapreview/freestyle"
+ADT_SQLCONSOLE = "/sap/bc/adt/datapreview/sqlConsole"
+mcp = FastMCP("__AGENT_NAME__", host="0.0.0.0", stateless_http=True)
+def _get_token(ctx):
+    try:
+        for h in ["x-amzn-bedrock-agentcore-runtime-custom-saptoken", "authorization"]:
+            val = ctx.request_context.request.headers.get(h, "")
+            if val:
+                return val.replace("Bearer ", "").replace("bearer ", "") if val.lower().startswith("bearer ") else val
+    except Exception: pass
+    return os.environ.get("SAP_BEARER_TOKEN", "")
+def _parse_adt_table(text):
+    """Parse ADT Data Preview XML (column-oriented) into a list of row dicts."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if text.startswith("{") or text.startswith("["):
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, list):
+                return [{str(k).upper(): v for k, v in r.items()} for r in obj]
+        except Exception:
+            pass
+    try:
+        root = ET.fromstring(text)
+    except Exception:
+        return []
+    def _local(t): return t.rsplit("}", 1)[-1]
+    cols, vals = [], []
+    for col in root.iter():
+        if _local(col.tag) != "columns":
+            continue
+        name = None; cells = []
+        for child in col:
+            lt = _local(child.tag)
+            if lt == "metadata":
+                name = child.attrib.get("name")
+            elif lt in ("dataSet", "data"):
+                for cell in (child.iter() if lt == "dataSet" else [child]):
+                    if _local(cell.tag) == "data":
+                        cells.append(cell.text or "")
+        if name is None:
+            for k, v in col.attrib.items():
+                if _local(k) == "name": name = v; break
+        if name:
+            cols.append(name.upper()); vals.append(cells)
+    if not cols:
+        return []
+    n = max((len(c) for c in vals), default=0)
+    rows = []
+    for i in range(n):
+        rows.append({cols[ci]: (vals[ci][i] if i < len(vals[ci]) else "") for ci in range(len(cols))})
+    return rows
+def _run_sql(token, sql, max_rows=100):
+    """Execute ABAP SQL via ADT Data Preview (freestyle POST, then sqlConsole GET)."""
+    sql = " ".join(sql.split())
+    with httpx.Client(verify=False, timeout=60.0) as c:
+        csrf = c.get(f"{SAP_BASE_URL}/sap/bc/adt/discovery",
+                     headers={"Authorization": "Bearer " + token, "x-csrf-token": "Fetch", "Accept": "*/*"}).headers.get("x-csrf-token", "")
+        last = None
+        for accept in ["application/xml", "application/vnd.sap.adt.datapreview.table.v1+xml", "*/*"]:
+            r = c.post(f"{SAP_BASE_URL}{ADT_FREESTYLE}", content=sql.encode("utf-8"),
+                       headers={"Authorization": "Bearer " + token, "Content-Type": "text/plain",
+                                "Accept": accept, "x-csrf-token": csrf},
+                       params={"rowNumber": str(max_rows)})
+            last = r
+            if r.status_code == 200:
+                return _parse_adt_table(r.text)
+            if r.status_code != 406:
+                break
+        r2 = c.get(f"{SAP_BASE_URL}{ADT_SQLCONSOLE}",
+                   headers={"Authorization": "Bearer " + token, "Accept": "application/xml"},
+                   params={"rowNumber": str(max_rows), "sqlCommand": sql})
+        if r2.status_code == 200:
+            return _parse_adt_table(r2.text)
+        raise RuntimeError("ADT SQL failed: freestyle=" + str(last.status_code if last else "n/a") + " sqlConsole=" + str(r2.status_code) + " body=" + (r2.text or "")[:200])
+def _num(v):
+    try: return float(str(v).strip() or 0)
+    except Exception: return 0.0
+def _sap_date(d): return d.strftime("%Y%m%d")
+def _window(days_back):
+    t = date.today()
+    return _sap_date(t - timedelta(days=days_back)), _sap_date(t)
+def _safe(s):
+    return re.sub(r"[^A-Za-z0-9]", "", str(s or ""))
+__TOOLS__
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http")
+'''
+
+
+def _strip_code_fences(code: str) -> str:
+    """Remove markdown code fences the model sometimes wraps generated code in.
+    Strips a leading ```python / ``` line and a trailing ``` line, plus any stray
+    fence lines, so the result is pure Python ready to embed in the template."""
+    if not code:
+        return code
+    lines = code.splitlines()
+    cleaned = []
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("```"):      # drop any fence line (```python, ```, etc.)
+            continue
+        cleaned.append(ln)
+    return "\n".join(cleaned).strip("\n")
+
+
+def _generate_s4_sql_tools(prompt: str, agent_name: str, tables: list = None) -> str:
+    """Generate ABAP-SQL-backed MCP tool functions via Claude. No OData — the
+    generated tools call _run_sql(token, sql) and aggregate in Python."""
+    bedrock = boto3.client("bedrock-runtime", region_name=boto3.session.Session().region_name)
+    system = (
+        "You are an expert SAP ABAP/S4HANA developer. Generate Python MCP tool functions "
+        "for a FastMCP server that queries SAP using DIRECT ABAP SQL (no OData, no CDS).\n\n"
+        "You have ONE data access method already defined in the file:\n"
+        "  _run_sql(token, sql, max_rows=100) -> list[dict]   # runs ABAP SQL via ADT Data Preview\n"
+        "Helpers also available: _num(v)->float, _sap_date(date)->'YYYYMMDD', "
+        "_window(days_back)->(date_from,date_to), _safe(s)->sanitized string.\n\n"
+        "ABAP SQL rules (CRITICAL):\n"
+        "- Use ABAP SQL syntax with ~ for field refs: h~ebeln, e~wrbtr.\n"
+        "- JOIN / INNER JOIN, GROUP BY, SUM(), COUNT(), MAX(), MIN(), CASE WHEN are supported.\n"
+        "- Do NOT use 'UP TO n ROWS' on JOIN queries (engine auto-caps at 100).\n"
+        "- SAP dates are 'YYYYMMDD' strings. Amounts come back as strings — wrap with _num().\n"
+        "- Result dict keys are UPPER-CASE column/alias names.\n\n"
+        "Tool pattern (follow EXACTLY):\n"
+        "@mcp.tool()\n"
+        "def tool_name(ctx: Context, days_back: int = 30, company_code: str = '') -> str:\n"
+        "    token = _get_token(ctx)\n"
+        "    if not token:\n"
+        "        return 'ERROR: no bearer token'\n"
+        "    date_from, date_to = _window(days_back)\n"
+        "    bukrs = (\" AND h~bukrs = '\" + _safe(company_code) + \"'\") if company_code else ''\n"
+        "    sql = (\"SELECT ... FROM ekko AS h INNER JOIN ekbe AS e ON e~ebeln = h~ebeln \"\n"
+        "           \"WHERE h~bstyp = 'F' AND h~bedat >= '\" + date_from + \"' AND h~bedat <= '\" + date_to + \"'\" + bukrs +\n"
+        "           \" GROUP BY ...\")\n"
+        "    try:\n"
+        "        rows = _run_sql(token, sql)\n"
+        "    except Exception as e:\n"
+        "        return json.dumps({'error': str(e), 'sql': sql})\n"
+        "    # aggregate / compute in Python, then build the report\n"
+        "    return json.dumps({'rows': rows, 'data_source': {'tables': [...], 'sql': sql}}, indent=2)\n\n"
+        "CRITICAL PYTHON SYNTAX RULES:\n"
+        "- Build SQL with string concatenation, NOT f-strings (avoid nested-quote bugs).\n"
+        "- Use 'Bearer ' + token, never f'Bearer {token}'.\n"
+        "- Each function starts with @mcp.tool() on its own line, 4-space indentation.\n"
+        "- Every tool wraps logic in try/except and returns a JSON string.\n"
+        "- Every tool's return MUST include a 'data_source' object with the exact tables and SQL used.\n"
+        "- Output ONLY Python function definitions. No imports, no main block, no markdown, no ```.\n"
+    )
+    user = f"Request: {prompt}\n\n"
+    if tables:
+        user += f"Primary SAP tables to use: {', '.join(tables)}\n\n"
+    user += ("Generate the focused MCP tools described in the request. "
+             "Each tool must run real ABAP SQL via _run_sql and compute the result in Python.")
+
+    resp = bedrock.invoke_model(
+        modelId=MODEL_ID,
+        body=json.dumps({"anthropic_version": "bedrock-2023-05-31", "max_tokens": 6000,
+                         "system": system,
+                         "messages": [{"role": "user", "content": user}]}),
+        contentType="application/json", accept="application/json")
+    code = json.loads(resp["body"].read())["content"][0]["text"]
+    return _strip_code_fences(code)
+
+
 _CALM_TEMPLATE = '''"""
 __DESCRIPTION__ — Auto-generated AI Factory MCP Agent (Cloud ALM).
 """
@@ -686,11 +865,14 @@ _jobs = {}  # job_id -> {status, agent_name, domain, error, codebuild_build_id, 
 
 
 def _run_generation_job(job_id: str, token: str, prompt: str, agent_name: str,
-                        odata_services: list = None):
+                        odata_services: list = None, backend: str = "odata",
+                        tables: list = None):
     """Background worker — does the heavy lifting (discovery, code gen, S3, CodeBuild).
     
     When odata_services is provided (discovery-first mode),
     skips internal discovery and uses pre-discovered OData services directly.
+
+    backend='sql' (s4 only): generate ABAP-SQL-backed tools (no OData/CDS discovery).
     """
     try:
         _jobs[job_id]["status"] = "discovering_services"
@@ -702,7 +884,7 @@ def _run_generation_job(job_id: str, token: str, prompt: str, agent_name: str,
         staging_bucket, codebuild_project = _ensure_infrastructure(region, ssm, cb, s3)
         domain = _detect_domain(prompt)
         _jobs[job_id]["domain"] = domain
-        logger.info(f"[{job_id}] Domain: {domain} | Agent: {agent_name} | Prompt: {prompt}"
+        logger.info(f"[{job_id}] Domain: {domain} | Backend: {backend} | Agent: {agent_name} | Prompt: {prompt}"
                      + (f" | Pre-discovered OData: {len(odata_services or [])} services" if odata_services else ""))
 
         if domain == "calm":
@@ -730,74 +912,87 @@ def _run_generation_job(job_id: str, token: str, prompt: str, agent_name: str,
             server_code = _SF_TEMPLATE.replace("__DESCRIPTION__", f"SAP SuccessFactors agent: {prompt}").replace("__AGENT_NAME__", agent_name).replace("__TOOLS__", tools_code)
 
         else:  # s4
-            svcs_with_entities = []
-
-            if odata_services:
-                # Discovery-first: use provided OData services, skip keyword discovery
-                logger.info(f"[{job_id}] Using {len(odata_services)} pre-discovered OData services")
-
-                # ── VERIFICATION GATE: Check all services are accessible before proceeding ──
-                inactive_services = []
-                for svc_name in odata_services:
-                    try:
-                        url = f"{SAP_BASE_URL}/sap/opu/odata/sap/{svc_name}/$metadata"
-                        with httpx.Client(verify=False, timeout=15) as vc:
-                            r = vc.get(url, headers={"Authorization": f"Bearer {token}"})
-                            if r.status_code != 200:
-                                inactive_services.append({"service": svc_name, "status": r.status_code})
-                                logger.warning(f"[{job_id}] Service {svc_name} NOT accessible: HTTP {r.status_code}")
-                    except Exception as ve:
-                        inactive_services.append({"service": svc_name, "status": f"error: {ve}"})
-
-                if inactive_services:
-                    _jobs[job_id]["status"] = "failed"
-                    _jobs[job_id]["error"] = (
-                        f"Cannot generate agent — {len(inactive_services)} OData service(s) are NOT accessible. "
-                        f"Register them in /IWFND/MAINT_SERVICE → Add Service → LOCAL first.\n"
-                        f"Inactive: {json.dumps(inactive_services)}"
-                    )
-                    return
-                logger.info(f"[{job_id}] All {len(odata_services)} OData services verified accessible")
-                # ── END VERIFICATION GATE ──
-
-                for svc_name in odata_services:
-                    path = f"/sap/opu/odata/sap/{svc_name}"
-                    entities = _get_entities_for_service(path, token)
-                    if entities:
-                        svcs_with_entities.append({"service_path": path,
-                                                   "title": svc_name, "entities": entities})
-                    else:
-                        logger.warning(f"[{job_id}] No entities found for pre-discovered service: {svc_name}")
+            if backend == "sql":
+                # SQL-backed: generate ABAP-SQL tools directly, no OData discovery.
+                _jobs[job_id]["status"] = "generating_code"
+                tools_code = _generate_s4_sql_tools(prompt, agent_name, tables=tables)
+                server_code = (_S4_SQL_TEMPLATE
+                               .replace("__DESCRIPTION__", f"SAP S/4HANA SQL agent: {prompt}")
+                               .replace("__AGENT_NAME__", agent_name)
+                               .replace("__TOOLS__", tools_code))
+                services_used = [f"ABAP SQL (ADT Data Preview): {', '.join(tables)}" if tables
+                                 else "ABAP SQL (ADT Data Preview)"]
+                # falls through to the shared validate → save → deploy block below
             else:
-                # Original behavior: keyword extraction + discovery
-                stop = {"with","that","this","from","have","will","should","tools","tool",
-                        "details","including","information","related","help","about","also",
-                        "their","them","these","those","into","like","such","some","other",
-                        "more","most","very","just","only","both","each","every"}
-                keywords = list(dict.fromkeys(
-                    w.strip(",.;:!?") for w in prompt.lower().split()
-                    if len(w.strip(",.;:!?")) > 3 and w.strip(",.;:!?") not in stop))
-                matched = _discover_relevant_services(token, keywords)
-                if not matched:
+                # ── OData-backed path (unchanged behavior) ──────────────────
+                svcs_with_entities = []
+
+                if odata_services:
+                    # Discovery-first: use provided OData services, skip keyword discovery
+                    logger.info(f"[{job_id}] Using {len(odata_services)} pre-discovered OData services")
+
+                    # ── VERIFICATION GATE: Check all services are accessible before proceeding ──
+                    inactive_services = []
+                    for svc_name in odata_services:
+                        try:
+                            url = f"{SAP_BASE_URL}/sap/opu/odata/sap/{svc_name}/$metadata"
+                            with httpx.Client(verify=False, timeout=15) as vc:
+                                r = vc.get(url, headers={"Authorization": f"Bearer {token}"})
+                                if r.status_code != 200:
+                                    inactive_services.append({"service": svc_name, "status": r.status_code})
+                                    logger.warning(f"[{job_id}] Service {svc_name} NOT accessible: HTTP {r.status_code}")
+                        except Exception as ve:
+                            inactive_services.append({"service": svc_name, "status": f"error: {ve}"})
+
+                    if inactive_services:
+                        _jobs[job_id]["status"] = "failed"
+                        _jobs[job_id]["error"] = (
+                            f"Cannot generate agent — {len(inactive_services)} OData service(s) are NOT accessible. "
+                            f"Register them in /IWFND/MAINT_SERVICE → Add Service → LOCAL first.\n"
+                            f"Inactive: {json.dumps(inactive_services)}"
+                        )
+                        return
+                    logger.info(f"[{job_id}] All {len(odata_services)} OData services verified accessible")
+                    # ── END VERIFICATION GATE ──
+
+                    for svc_name in odata_services:
+                        path = f"/sap/opu/odata/sap/{svc_name}"
+                        entities = _get_entities_for_service(path, token)
+                        if entities:
+                            svcs_with_entities.append({"service_path": path,
+                                                       "title": svc_name, "entities": entities})
+                        else:
+                            logger.warning(f"[{job_id}] No entities found for pre-discovered service: {svc_name}")
+                else:
+                    # Original behavior: keyword extraction + discovery
+                    stop = {"with","that","this","from","have","will","should","tools","tool",
+                            "details","including","information","related","help","about","also",
+                            "their","them","these","those","into","like","such","some","other",
+                            "more","most","very","just","only","both","each","every"}
+                    keywords = list(dict.fromkeys(
+                        w.strip(",.;:!?") for w in prompt.lower().split()
+                        if len(w.strip(",.;:!?")) > 3 and w.strip(",.;:!?") not in stop))
+                    matched = _discover_relevant_services(token, keywords)
+                    if not matched:
+                        _jobs[job_id]["status"] = "failed"
+                        _jobs[job_id]["error"] = f"No S/4 services found for: {prompt}"
+                        return
+                    for svc in (matched or [])[:5]:
+                        path = f"/sap/opu/odata/sap/{svc['Title']}"
+                        entities = _get_entities_for_service(path, token)
+                        if entities:
+                            svcs_with_entities.append({"service_path": path,
+                                                       "title": svc["Title"], "entities": entities})
+
+                if not svcs_with_entities:
                     _jobs[job_id]["status"] = "failed"
-                    _jobs[job_id]["error"] = f"No S/4 services found for: {prompt}"
+                    _jobs[job_id]["error"] = "No OData services available. Use the OData Agent to explore data and create CDS views first, or use backend='sql' to query tables directly."
                     return
-                for svc in (matched or [])[:5]:
-                    path = f"/sap/opu/odata/sap/{svc['Title']}"
-                    entities = _get_entities_for_service(path, token)
-                    if entities:
-                        svcs_with_entities.append({"service_path": path,
-                                                   "title": svc["Title"], "entities": entities})
 
-            if not svcs_with_entities:
-                _jobs[job_id]["status"] = "failed"
-                _jobs[job_id]["error"] = "No OData services available. Use the OData Agent to explore data and create CDS views first."
-                return
-
-            _jobs[job_id]["status"] = "generating_code"
-            tools_code = _generate_s4_tools(prompt, svcs_with_entities, agent_name)
-            server_code = _S4_TEMPLATE.replace("__DESCRIPTION__", f"SAP S/4HANA agent: {prompt}").replace("__AGENT_NAME__", agent_name).replace("__TOOLS__", tools_code)
-            services_used = [s["service_path"] for s in svcs_with_entities]
+                _jobs[job_id]["status"] = "generating_code"
+                tools_code = _generate_s4_tools(prompt, svcs_with_entities, agent_name)
+                server_code = _S4_TEMPLATE.replace("__DESCRIPTION__", f"SAP S/4HANA agent: {prompt}").replace("__AGENT_NAME__", agent_name).replace("__TOOLS__", tools_code)
+                services_used = [s["service_path"] for s in svcs_with_entities]
 
         _jobs[job_id]["services_used"] = services_used
 
@@ -878,7 +1073,9 @@ def _run_generation_job(job_id: str, token: str, prompt: str, agent_name: str,
 @mcp.tool()
 def generate_and_deploy_mcp_server(ctx: Context, prompt: str, agent_name: str,
                                     deploy_target: str = "container",
-                                    odata_services: str = "") -> str:
+                                    odata_services: str = "",
+                                    backend: str = "auto",
+                                    tables: str = "") -> str:
     """Generate a new focused SAP MCP agent and deploy it.
 
     FIRE-AND-FORGET: Returns a job_id immediately. Use check_generation_status(job_id)
@@ -895,18 +1092,31 @@ def generate_and_deploy_mcp_server(ctx: Context, prompt: str, agent_name: str,
     Automatically detects the target domain from the prompt:
     - 'calm' — SAP Cloud ALM / Rise / Cloud ERP (projects, tasks, monitoring, analytics)
     - 'sf'   — SAP SuccessFactors HCM (employees, recruiting, learning, performance)
-    - 's4'   — SAP S/4HANA OData (default — auto-discovers relevant OData services from catalog)
+    - 's4'   — SAP S/4HANA (default)
+
+    Backend (how the generated S/4HANA agent reaches SAP):
+    - 'auto' (default) — PREFER OData. Resolves to 'odata' and runs discovery.
+      OData is the production-safe, governed path and is always preferred.
+    - 'odata' — PREFERRED. Generated tools call OData services (requires activated
+      services / CDS views; pass them via odata_services). Discovery runs if none
+      provided.
+    - 'sql'   — FALLBACK ONLY (explicit opt-in). Generated tools run DIRECT ABAP SQL
+      via the ADT Data Preview endpoint (no OData, no CDS, no BASIS activation). Use
+      only when no activated OData service exists and a CDS view cannot be created.
+      Use 'tables' to hint the primary SAP tables (e.g. "EKKO,EKPO,EKBE,LFA1").
+      Only applies to the 's4' domain.
 
     Discovery-first mode: When odata_services is provided, the generator skips
     internal discovery and uses the pre-discovered, user-reviewed OData services
-    directly. For S/4HANA agents, only verified OData service names are accepted.
-    Use the OData Agent to explore data and create CDS views first if needed.
+    directly.
 
     Args:
         prompt:         Natural language description of what the agent should do.
         agent_name:     Short lowercase underscore identifier for the agent.
         deploy_target:  'container' (Fargate+ALB, default) or 'agentcore' (Bedrock AgentCore).
         odata_services: Optional JSON-encoded list of OData service names (S4), API paths (CALM), or entity paths (SF).
+        backend:        's4' data access: 'auto' | 'sql' | 'odata'.
+        tables:         Comma-separated SAP tables to hint the SQL backend (e.g. "EKKO,EKPO,EKBE").
 
     Returns JSON with job_id to track progress via check_generation_status.
     """
@@ -916,6 +1126,9 @@ def generate_and_deploy_mcp_server(ctx: Context, prompt: str, agent_name: str,
 
     if deploy_target not in ("container", "agentcore"):
         return json.dumps({"error": f"Invalid deploy_target: {deploy_target}. Use 'container' or 'agentcore'."})
+
+    if backend not in ("auto", "sql", "odata"):
+        return json.dumps({"error": f"Invalid backend: {backend}. Use 'auto', 'sql', or 'odata'."})
 
     # Parse optional discovery-first parameters
     parsed_odata = None
@@ -927,6 +1140,15 @@ def generate_and_deploy_mcp_server(ctx: Context, prompt: str, agent_name: str,
         except json.JSONDecodeError as e:
             return json.dumps({"error": f"Invalid JSON in odata_services: {e}"})
 
+    # Resolve 'auto' backend. OData is PREFERRED (production-safe, governed).
+    # 'auto' only uses SQL as an explicit fallback when the caller already knows
+    # there are no OData services AND passed none — otherwise it tries OData first.
+    resolved_backend = backend
+    if backend == "auto":
+        resolved_backend = "odata"   # prefer OData; discovery will run if none supplied
+
+    parsed_tables = [t.strip().upper() for t in tables.split(",") if t.strip()] if tables else []
+
     job_id = str(uuid.uuid4())[:8]
     _jobs[job_id] = {
         "status": "accepted",
@@ -934,6 +1156,8 @@ def generate_and_deploy_mcp_server(ctx: Context, prompt: str, agent_name: str,
         "prompt": prompt,
         "domain": None,
         "deploy_target": deploy_target,
+        "backend": resolved_backend,
+        "tables": parsed_tables,
         "services_used": [],
         "codebuild_build_id": None,
         "endpoint": None,
@@ -944,11 +1168,13 @@ def generate_and_deploy_mcp_server(ctx: Context, prompt: str, agent_name: str,
     # Fire off background thread
     t = threading.Thread(target=_run_generation_job,
                          args=(job_id, token, prompt, agent_name),
-                         kwargs={"odata_services": parsed_odata},
+                         kwargs={"odata_services": parsed_odata,
+                                 "backend": resolved_backend,
+                                 "tables": parsed_tables},
                          daemon=True)
     t.start()
 
-    logger.info(f"[{job_id}] Job accepted for '{agent_name}' (target={deploy_target}) — running in background")
+    logger.info(f"[{job_id}] Job accepted for '{agent_name}' (target={deploy_target}, backend={resolved_backend}) — running in background")
     return json.dumps({
         "status": "accepted",
         "job_id": job_id,
@@ -1042,6 +1268,16 @@ def create_generator_strands_agent() -> Agent:
                 "easy to add Okta auth via ALB rules, works anywhere.\n"
                 "  2. **AgentCore** — Bedrock AgentCore Runtime via CodeBuild. Takes ~10-15 min.\n\n"
                 "If the user doesn't specify, default to 'container'.\n\n"
+                "Backend selection for S/4HANA agents (how the agent reaches SAP):\n"
+                "  - **OData is PREFERRED and the default** — production-safe and governed.\n"
+                "    Use backend='odata' (or 'auto'). If specific activated services are known,\n"
+                "    pass them via odata_services.\n"
+                "  - **SQL is a FALLBACK only.** Use backend='sql' ONLY when the user confirms\n"
+                "    there is no activated OData service and creating a CDS view is not an option.\n"
+                "    SQL queries SAP tables directly via ADT (pass primary tables via 'tables').\n"
+                "  Before generating an S/4HANA agent, if no OData service is available, ASK the\n"
+                "  user: 'No activated OData service was found. Create a CDS view/OData service\n"
+                "  (preferred), or fall back to direct SQL on tables?' Do NOT silently choose SQL.\n\n"
                 "Domain detection is automatic:\n"
                 "- 'calm' — SAP Cloud ALM (Rise/Cloud ERP: projects, monitoring, analytics)\n"
                 "- 'sf'   — SAP SuccessFactors (HR: employees, recruiting, learning, performance)\n"
