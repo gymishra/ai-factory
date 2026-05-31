@@ -1078,9 +1078,12 @@ def generate_and_deploy_mcp_server(ctx: Context, prompt: str, agent_name: str,
                                     tables: str = "") -> str:
     """Generate a new focused SAP MCP agent and deploy it.
 
-    FIRE-AND-FORGET: Returns a job_id immediately. Use check_generation_status(job_id)
-    to poll for progress. The heavy work (service discovery, Claude code generation,
-    build, deploy) runs in the background.
+    SYNCHRONOUS: discovery, code generation, S3 upload, and CodeBuild trigger all
+    run inside this call, then it returns the real codebuild_build_id. (A previous
+    fire-and-forget thread design did NOT survive AgentCore's container recycling —
+    the thread was killed before reaching CodeBuild, so nothing ever deployed.)
+    CodeBuild itself then runs in AWS (~10-15 min) independent of this container;
+    poll check_generation_status / `aws codebuild batch-get-builds` for completion.
 
     Deployment targets:
     - 'container' (DEFAULT, recommended) — Builds Docker image, pushes to ECR,
@@ -1165,25 +1168,31 @@ def generate_and_deploy_mcp_server(ctx: Context, prompt: str, agent_name: str,
         "odata_services_provided": parsed_odata or [],
     }
 
-    # Fire off background thread
-    t = threading.Thread(target=_run_generation_job,
-                         args=(job_id, token, prompt, agent_name),
-                         kwargs={"odata_services": parsed_odata,
-                                 "backend": resolved_backend,
-                                 "tables": parsed_tables},
-                         daemon=True)
-    t.start()
+    # SYNCHRONOUS deploy (matches the proven smart-agent design). Fire-and-forget
+    # background threads DO NOT survive AgentCore's frequent container recycling —
+    # the thread was being killed before reaching CodeBuild. Running inline means
+    # the S3 upload + start_build complete within this tool call; CodeBuild then
+    # runs independently in AWS (~10-15 min), unaffected by container lifecycle.
+    logger.info(f"[{job_id}] Job accepted for '{agent_name}' (target={deploy_target}, backend={resolved_backend}) — running SYNCHRONOUSLY")
+    _run_generation_job(job_id, token, prompt, agent_name,
+                        odata_services=parsed_odata,
+                        backend=resolved_backend,
+                        tables=parsed_tables)
 
-    logger.info(f"[{job_id}] Job accepted for '{agent_name}' (target={deploy_target}, backend={resolved_backend}) — running in background")
+    job = _jobs.get(job_id, {})
     return json.dumps({
-        "status": "accepted",
+        "status": job.get("status"),
         "job_id": job_id,
         "agent_name": agent_name,
         "deploy_target": deploy_target,
-        "message": (
-            f"Generation job '{job_id}' started. Deploy target: {deploy_target}. "
-            f"Use check_generation_status(job_id='{job_id}') to track progress."
-        ),
+        "backend": resolved_backend,
+        "domain": job.get("domain"),
+        "services_used": job.get("services_used"),
+        "codebuild_build_id": job.get("codebuild_build_id"),
+        "endpoint": job.get("endpoint"),
+        "error": job.get("error"),
+        "message": job.get("message",
+                           f"Generation finished with status '{job.get('status')}'."),
     }, indent=2)
 
 
