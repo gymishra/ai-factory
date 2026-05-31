@@ -17,8 +17,9 @@ imported tools' _get_token(ctx) fallback picks it up in-process.
 import os, sys, json, logging, time, base64, hashlib
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import inspect, functools
 from mcp.server.fastmcp import FastMCP, Context
-from strands import Agent
+from strands import Agent, tool
 from strands.models import BedrockModel
 from strands.agent.conversation_manager import SlidingWindowConversationManager
 from strands.hooks import AgentInitializedEvent, HookProvider, HookRegistry, MessageAddedEvent
@@ -150,7 +151,43 @@ _MAX_TURNS = int(os.environ.get("MAX_AGENT_TURNS", "12"))
 
 # ── Import tool functions in-process from each agent module ───────────────────
 # The @mcp.tool() decorator on the sub-agent modules returns the original
-# callable, so these names are plain functions we can hand to a Strands Agent.
+# callable. A plain callable is NOT a valid Strands tool spec, though — handing
+# raw functions to Agent(tools=[...]) makes Strands log "unrecognized tool
+# specification" and register ZERO tools, so the model then hallucinates fake
+# tool calls. We must convert each function into a Strands tool first.
+#
+# _strandify() drops the FastMCP-injected `ctx` parameter (the sub-tools read the
+# JWT from os.environ['SAP_BEARER_TOKEN'] when ctx is None — set by _run) and
+# wraps the function with the Strands @tool decorator so it registers correctly
+# while still executing in-process (no HTTP hop, no 55s timeout).
+
+def _strandify(fn):
+    """Convert a FastMCP (ctx, ...) function into a valid Strands tool."""
+    sig = inspect.signature(fn)
+    params = [p for name, p in sig.parameters.items() if name != "ctx"]
+    new_sig = sig.replace(parameters=params)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        kwargs.pop("ctx", None)          # in case the model passes ctx explicitly
+        return fn(None, *args, **kwargs)  # ctx=None → tool falls back to env token
+
+    wrapper.__signature__ = new_sig
+    ann = dict(getattr(fn, "__annotations__", {}))
+    ann.pop("ctx", None)
+    wrapper.__annotations__ = ann
+    return tool(wrapper)
+
+
+def _strandify_all(fns):
+    out = []
+    for f in fns:
+        try:
+            out.append(_strandify(f))
+        except Exception as e:
+            logger.error(f"Failed to strandify tool {getattr(f, '__name__', f)}: {e}")
+    return out
+
 
 from agents import adt_agent as _adt
 from agents import odata_agent as _odata
@@ -161,7 +198,7 @@ import calm_tools as _calm_tools
 import sf_tools as _sf_tools
 
 
-_ADT_TOOLS = [
+_ADT_TOOLS = _strandify_all([
     _adt.get_abap_program, _adt.get_abap_class, _adt.get_function_module,
     _adt.get_abap_interface, _adt.get_abap_include, _adt.search_objects,
     _adt.get_package, _adt.get_transaction, _adt.get_table_definition,
@@ -170,9 +207,9 @@ _ADT_TOOLS = [
     _adt.list_user_transports, _adt.create_odata_service,
     _adt.verify_cds_exists, _adt.activate_odata_service,
     _adt.list_backend_services, _adt.adt_discovery,
-]
+])
 
-_ODATA_TOOLS = [
+_ODATA_TOOLS = _strandify_all([
     _odata.search_sap_services, _odata.get_service_metadata, _odata.query_sap_odata,
     _odata.get_sap_entity, _odata.create_sap_entity, _odata.update_sap_entity,
     _odata.delete_sap_entity, _odata.get_service_entities, _odata.get_entity_properties,
@@ -183,9 +220,9 @@ _ODATA_TOOLS = [
     _odata.run_sql_query, _odata.get_research_summary, _odata.create_cds_views_from_research,
     _odata.clear_research_history, _odata.list_sap_ec2_instances, _odata.run_hana_sql,
     _odata.smart_query,
-]
+])
 
-_CALM_TOOLS = [
+_CALM_TOOLS = _strandify_all([
     _calm_tools.calm_list_projects, _calm_tools.calm_get_project,
     _calm_tools.calm_list_project_timeboxes, _calm_tools.calm_list_project_teams,
     _calm_tools.calm_list_programs, _calm_tools.calm_create_project,
@@ -207,21 +244,21 @@ _CALM_TOOLS = [
     _calm_tools.calm_list_monitoring_events, _calm_tools.calm_get_monitoring_event,
     _calm_tools.calm_list_monitored_services, _calm_tools.calm_list_analytics_providers,
     _calm_tools.calm_query_analytics,
-]
+])
 
-_SF_TOOLS = [
+_SF_TOOLS = _strandify_all([
     _sf_tools.sf_list_employees, _sf_tools.sf_get_employee_employment,
     _sf_tools.sf_list_positions, _sf_tools.sf_list_departments,
     _sf_tools.sf_list_locations, _sf_tools.sf_list_users,
     _sf_tools.sf_list_job_requisitions, _sf_tools.sf_list_candidates,
     _sf_tools.sf_list_learning_activities, _sf_tools.sf_list_performance_reviews,
     _sf_tools.sf_list_compensation,
-]
+])
 
-_GEN_TOOLS = [
+_GEN_TOOLS = _strandify_all([
     _gen.generate_and_deploy_mcp_server, _gen.check_generation_status,
     _gen.list_generated_mcp_servers,
-]
+])
 
 
 # ── Token extraction ──────────────────────────────────────────────────────────
