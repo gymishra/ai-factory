@@ -394,11 +394,15 @@ def _generate_s4_sql_tools(prompt: str, agent_name: str, tables: list = None) ->
     if tables:
         user += f"Primary SAP tables to use: {', '.join(tables)}\n\n"
     user += ("Generate the focused MCP tools described in the request. "
-             "Each tool must run real ABAP SQL via _run_sql and compute the result in Python.")
+             "Each tool must run real ABAP SQL via _run_sql and compute the result in Python.\n"
+             "Keep each tool compact and self-contained. CRITICAL: emit COMPLETE, "
+             "syntactically valid Python — every '(' , '[' and '{' must be closed. "
+             "Do not truncate mid-function; if space is tight, generate fewer helper "
+             "lines rather than leaving a structure unclosed.")
 
     resp = bedrock.invoke_model(
         modelId=MODEL_ID,
-        body=json.dumps({"anthropic_version": "bedrock-2023-05-31", "max_tokens": 6000,
+        body=json.dumps({"anthropic_version": "bedrock-2023-05-31", "max_tokens": 8192,
                          "system": system,
                          "messages": [{"role": "user", "content": user}]}),
         contentType="application/json", accept="application/json")
@@ -921,11 +925,28 @@ def _run_generation_job(job_id: str, token: str, prompt: str, agent_name: str,
             if backend == "sql":
                 # SQL-backed: generate ABAP-SQL tools directly, no OData discovery.
                 _jobs[job_id]["status"] = "generating_code"
-                tools_code = _generate_s4_sql_tools(prompt, agent_name, tables=tables)
-                server_code = (_S4_SQL_TEMPLATE
-                               .replace("__DESCRIPTION__", f"SAP S/4HANA SQL agent: {prompt}")
-                               .replace("__AGENT_NAME__", agent_name)
-                               .replace("__TOOLS__", tools_code))
+                # Generate SQL tools, retrying if Claude emits invalid Python
+                # (occasional unbalanced bracket / truncation). Validate each attempt.
+                server_code = None
+                last_err = None
+                for attempt in range(1, 4):
+                    tools_code = _generate_s4_sql_tools(prompt, agent_name, tables=tables)
+                    candidate = (_S4_SQL_TEMPLATE
+                                 .replace("__DESCRIPTION__", f"SAP S/4HANA SQL agent: {prompt}")
+                                 .replace("__AGENT_NAME__", agent_name)
+                                 .replace("__TOOLS__", tools_code))
+                    try:
+                        compile(candidate, f"{agent_name}_server.py", "exec")
+                        server_code = candidate
+                        logger.info(f"[{job_id}] SQL codegen valid on attempt {attempt}")
+                        break
+                    except SyntaxError as se:
+                        last_err = f"line {se.lineno}: {se.msg}"
+                        logger.warning(f"[{job_id}] SQL codegen attempt {attempt} invalid ({last_err}); retrying")
+                if server_code is None:
+                    _jobs[job_id]["status"] = "failed"
+                    _jobs[job_id]["error"] = f"SQL codegen produced invalid Python after 3 attempts (last: {last_err})"
+                    return
                 services_used = [f"ABAP SQL (ADT Data Preview): {', '.join(tables)}" if tables
                                  else "ABAP SQL (ADT Data Preview)"]
                 # falls through to the shared validate → save → deploy block below
