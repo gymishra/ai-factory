@@ -295,13 +295,17 @@ def _parse_adt_table(text):
         rows.append({cols[ci]: (vals[ci][i] if i < len(vals[ci]) else "") for ci in range(len(cols))})
     return rows
 def _run_sql(token, sql, max_rows=100):
-    """Execute ABAP SQL via ADT Data Preview (freestyle POST, then sqlConsole GET)."""
+    """Execute ABAP SQL via ADT Data Preview freestyle POST.
+    On a 4xx/5xx SQL error, return it immediately (do NOT hang on a dead fallback).
+    Only the sqlConsole GET is tried as a last resort, with a short timeout."""
     sql = " ".join(sql.split())
     with httpx.Client(verify=False, timeout=60.0) as c:
         csrf = c.get(f"{SAP_BASE_URL}/sap/bc/adt/discovery",
                      headers={"Authorization": "Bearer " + token, "x-csrf-token": "Fetch", "Accept": "*/*"}).headers.get("x-csrf-token", "")
         last = None
-        for accept in ["application/xml", "application/vnd.sap.adt.datapreview.table.v1+xml", "*/*"]:
+        # Correct content type FIRST (table.v1+xml), then xml, then */*. A 406 means
+        # try the next Accept; any other status (200/400/500) is final for freestyle.
+        for accept in ["application/vnd.sap.adt.datapreview.table.v1+xml", "application/xml", "*/*"]:
             r = c.post(f"{SAP_BASE_URL}{ADT_FREESTYLE}", content=sql.encode("utf-8"),
                        headers={"Authorization": "Bearer " + token, "Content-Type": "text/plain",
                                 "Accept": accept, "x-csrf-token": csrf},
@@ -311,12 +315,26 @@ def _run_sql(token, sql, max_rows=100):
                 return _parse_adt_table(r.text)
             if r.status_code != 406:
                 break
-        r2 = c.get(f"{SAP_BASE_URL}{ADT_SQLCONSOLE}",
-                   headers={"Authorization": "Bearer " + token, "Accept": "application/xml"},
-                   params={"rowNumber": str(max_rows), "sqlCommand": sql})
-        if r2.status_code == 200:
-            return _parse_adt_table(r2.text)
-        raise RuntimeError("ADT SQL failed: freestyle=" + str(last.status_code if last else "n/a") + " sqlConsole=" + str(r2.status_code) + " body=" + (r2.text or "")[:200])
+        # Surface a real SQL error from freestyle immediately — sqlConsole does not
+        # exist on all systems (404) and must never hang the request.
+        if last is not None and last.status_code not in (404, 406):
+            msg = last.text
+            import re as _re
+            m = _re.search(r"<message[^>]*>([^<]+)</message>", msg or "")
+            raise RuntimeError("ADT SQL error (freestyle HTTP " + str(last.status_code) + "): "
+                               + (m.group(1) if m else (msg or "")[:200]))
+        try:
+            r2 = c.get(f"{SAP_BASE_URL}{ADT_SQLCONSOLE}",
+                       headers={"Authorization": "Bearer " + token, "Accept": "application/xml"},
+                       params={"rowNumber": str(max_rows), "sqlCommand": sql},
+                       timeout=15.0)
+            if r2.status_code == 200:
+                return _parse_adt_table(r2.text)
+            raise RuntimeError("ADT SQL failed: freestyle=" + str(last.status_code if last else "n/a")
+                               + " sqlConsole=" + str(r2.status_code))
+        except httpx.TimeoutException:
+            raise RuntimeError("ADT SQL failed: freestyle=" + str(last.status_code if last else "n/a")
+                               + " sqlConsole=timeout")
 def _num(v):
     try: return float(str(v).strip() or 0)
     except Exception: return 0.0
@@ -363,6 +381,11 @@ def _generate_s4_sql_tools(prompt: str, agent_name: str, tables: list = None) ->
         "- Use ABAP SQL syntax with ~ for field refs: h~ebeln, e~wrbtr.\n"
         "- JOIN / INNER JOIN, GROUP BY, SUM(), COUNT(), MAX(), MIN(), CASE WHEN are supported.\n"
         "- Do NOT use 'UP TO n ROWS' on JOIN queries (engine auto-caps at 100).\n"
+        "- NEVER use an empty string literal '' in a CASE/ELSE or anywhere — the ADT engine\n"
+        "  rejects it ('empty character literal'). For a 'no value' fallback use a single\n"
+        "  space ' ' for char fields, '00000000' for date (e~budat) fields, or 0 for numeric.\n"
+        "  e.g. MAX( CASE WHEN e~vgabe = '1' THEN e~budat ELSE '00000000' END ).\n"
+        "- Use LOWERCASE column aliases (AS gr_amt, not AS GR_AMT).\n"
         "- SAP dates are 'YYYYMMDD' strings. Amounts come back as strings — wrap with _num().\n"
         "- Result dict keys are UPPER-CASE column/alias names.\n\n"
         "Tool pattern (follow EXACTLY):\n"
