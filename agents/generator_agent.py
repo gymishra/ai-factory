@@ -368,6 +368,9 @@ def _generate_s4_sql_tools(prompt: str, agent_name: str, tables: list = None) ->
         "Tool pattern (follow EXACTLY):\n"
         "@mcp.tool()\n"
         "def tool_name(ctx: Context, days_back: int = 30, company_code: str = '') -> str:\n"
+        "    \"\"\"One-line summary of what this tool returns. Mention the SAP tables and the\n"
+        "    key business concept (e.g. 'GR/IR open items: POs with goods received but not\n"
+        "    yet invoiced'). Document each argument. This docstring is REQUIRED.\"\"\"\n"
         "    token = _get_token(ctx)\n"
         "    if not token:\n"
         "        return 'ERROR: no bearer token'\n"
@@ -385,7 +388,9 @@ def _generate_s4_sql_tools(prompt: str, agent_name: str, tables: list = None) ->
         "CRITICAL PYTHON SYNTAX RULES:\n"
         "- Build SQL with string concatenation, NOT f-strings (avoid nested-quote bugs).\n"
         "- Use 'Bearer ' + token, never f'Bearer {token}'.\n"
-        "- Each function starts with @mcp.tool() on its own line, 4-space indentation.\n"
+        "- Every tool starts with @mcp.tool() on its own line, 4-space indentation.\n"
+        "- Every tool MUST have a descriptive docstring as its first statement (used by\n"
+        "  MCP clients to describe the tool — never leave it blank).\n"
         "- Every tool wraps logic in try/except and returns a JSON string.\n"
         "- Every tool's return MUST include a 'data_source' object with the exact tables and SQL used.\n"
         "- Output ONLY Python function definitions. No imports, no main block, no markdown, no ```.\n"
@@ -1032,7 +1037,9 @@ def _run_generation_job(job_id: str, token: str, prompt: str, agent_name: str,
             return
 
         # Build meta BEFORE saving (was a bug — meta used before defined)
-        requirements = "mcp\nhttpx\nboto3\n"
+        # PIN mcp<1.20: mcp>=1.20 (e.g. 1.27.2) breaks the AgentCore streamable-HTTP
+        # transport — strict client handshakes (Kiro, QuickSuite) fail to connect.
+        requirements = "mcp>=1.10.0,<1.20.0\nhttpx\nboto3\n"
         meta = {"agent_name": agent_name, "prompt": prompt, "domain": domain, "services": services_used}
 
         # Persist generated code to EFS/disk
